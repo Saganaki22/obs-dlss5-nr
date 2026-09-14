@@ -784,12 +784,12 @@ static void ShutdownUnlocked()
 	g_cmd_alloc.Reset();
 	g_cmd.Reset();
 	g_fence.Reset();
-	if (g_shim_mod)
-		FreeLibrary(g_shim_mod);
-	if (g_nr_mod)
-		FreeLibrary(g_nr_mod);
-	if (g_core_mod)
-		FreeLibrary(g_core_mod);
+	// The NGX core and the NR runtime own driver worker threads and live D3D12
+	// state. Unloading them here deadlocks inside the NVIDIA D3D12 UMD:
+	// FreeLibrary(g_nr_mod) never returns, which wedges the OBS destroy queue
+	// that dlss5nr_destroy runs on, and OBS then hangs on exit waiting in
+	// obs_wait_for_destroy_queue. Leave them mapped and let process teardown
+	// reclaim them; a later init reloads them and reuses the mapped image.
 	g_shim_mod = g_nr_mod = g_core_mod = nullptr;
 
 	g_core_init_ext = nullptr;
