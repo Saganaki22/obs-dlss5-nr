@@ -29,6 +29,8 @@
 
 #include "nr_bridge.h"
 #include "nvof_flow.h"
+#include "ngx-diagnostics.h"
+#include <util/base.h>
 
 using Microsoft::WRL::ComPtr;
 using NGXResult = int;
@@ -66,25 +68,6 @@ struct NGXParameter {
 	virtual void Reset() = 0;
 };
 
-struct NGXPathListInfo {
-	wchar_t const *const *Path;
-	unsigned int Length;
-};
-enum NGXLoggingLevel { NGX_LOG_OFF = 0, NGX_LOG_ON = 1, NGX_LOG_VERBOSE = 2 };
-using NGXLogCallback = void(__cdecl *)(const char *, NGXLoggingLevel, int);
-struct NGXLoggingInfo {
-	NGXLoggingLevel LoggingLevel;
-	NGXLogCallback Callback;
-	void *UserData;
-	bool DisableOtherLoggingSinks;
-};
-struct NGXFeatureCommonInfoInternal;
-struct NGXFeatureCommonInfo {
-	NGXPathListInfo PathListInfo;
-	NGXFeatureCommonInfoInternal *InternalData;
-	NGXLoggingInfo LoggingInfo;
-};
-
 using InitExtFn = NGXResult(__cdecl *)(unsigned long long, const wchar_t *, ID3D12Device *, int, const void *);
 using SnippetInitFn = NGXResult(__cdecl *)(unsigned long long, const wchar_t *, ID3D12Device *, const void *, int);
 using InitProjectIdFn = NGXResult(__cdecl *)(const char *, int, const char *, const wchar_t *, ID3D12Device *, int,
@@ -108,6 +91,10 @@ static std::string g_gpu_name = "unknown";
 static std::wstring g_runtime_dir;
 static int g_gpu_index = 0;
 static std::atomic<bool> g_initialized{false};
+static std::atomic<bool> g_diagnostics{false};
+static std::atomic<uint64_t> g_retry_generation{0};
+static ngx_diagnostics::CreateRetry g_create_retry;
+static std::string g_create_error;
 
 static HMODULE g_core_mod = nullptr;
 static HMODULE g_nr_mod = nullptr;
@@ -123,6 +110,9 @@ static SnippetInitFn g_nr_init = nullptr;
 static CreateFeatureFn g_nr_create = nullptr;
 static EvaluateFeatureFn g_nr_eval = nullptr;
 static ReleaseFeatureFn g_nr_release = nullptr;
+using SetLogCallbackFn = void(__cdecl *)(NGXLogCallback);
+static SetLogCallbackFn g_set_log_callback = nullptr;
+static NGXLogCallback g_log_proxy = nullptr;
 static ShimInitFn g_shim_init = nullptr;
 static ShimCreateFn g_shim_create = nullptr;
 static ShimEvaluateFn g_shim_eval = nullptr;
@@ -741,6 +731,71 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 	g_params->Set("DLSSNR.OutputSubrectHeight", g_height);
 }
 
+static void __cdecl NGXLog(const char *message, NGXLoggingLevel, int component)
+{
+	// NGX can invoke this from its own threads: no bridge lock or NGX calls.
+	if (message && g_diagnostics.load(std::memory_order_relaxed))
+		blog(LOG_INFO, "[obs-dlss5-nr][NGX:%d] %s", component, message);
+}
+
+static void LogModule(const char *label, HMODULE module)
+{
+	wchar_t path[32768]{};
+	if (!GetModuleFileNameW(module, path, ARRAYSIZE(path)))
+		return;
+	std::string version = "unknown";
+	DWORD unused = 0;
+	const DWORD bytes = GetFileVersionInfoSizeW(path, &unused);
+	std::vector<uint8_t> data(bytes);
+	if (bytes && GetFileVersionInfoW(path, 0, bytes, data.data())) {
+		VS_FIXEDFILEINFO *info = nullptr;
+		UINT size = 0;
+		if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<void **>(&info), &size) && info &&
+		    size >= sizeof(*info)) {
+			char text[80];
+			snprintf(text, sizeof(text), "%u.%u.%u.%u", HIWORD(info->dwFileVersionMS),
+				 LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS),
+				 LOWORD(info->dwFileVersionLS));
+			version = text;
+		}
+	}
+	const int utf8_size = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+	std::string utf8(utf8_size > 0 ? utf8_size : 1, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8.data(), (int)utf8.size(), nullptr, nullptr);
+	WIN32_FILE_ATTRIBUTE_DATA attributes{};
+	uint64_t file_bytes = 0;
+	if (GetFileAttributesExW(path, GetFileExInfoStandard, &attributes))
+		file_bytes = (uint64_t(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+	blog(LOG_INFO, "[obs-dlss5-nr] diagnostic %s: version=%s bytes=%llu path=%s", label, version.c_str(),
+	     (unsigned long long)file_bytes, utf8.c_str());
+}
+
+static void LogCreateParams(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure,
+			    float skin, int automask, int ui_correction, bool temporal)
+{
+	DXGI_ADAPTER_DESC1 adapter{};
+	LARGE_INTEGER driver{};
+	if (g_adapter) {
+		g_adapter->GetDesc1(&adapter);
+		g_adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver);
+	}
+	blog(LOG_INFO,
+	     "[obs-dlss5-nr] CreateFeature(18) attempt: gpu=%s vendor=0x%04X device=0x%04X "
+	     "luid=%08X:%08X driver=%u.%u.%u.%u size=%ux%u style=%d preset=%d intensity=%.3f tone=%.3f "
+	     "structure=%.3f skin=%.3f automask=%d ui=%d temporal=%d path=%s",
+	     g_gpu_name.c_str(), adapter.VendorId, adapter.DeviceId, (unsigned)adapter.AdapterLuid.HighPart,
+	     adapter.AdapterLuid.LowPart, HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart),
+	     LOWORD(driver.LowPart), w, h, style, preset, intensity, tone, structure, skin, automask, ui_correction,
+	     temporal, g_gpu_mode ? "GPU sharing" : "CPU staging");
+	for (const auto &resource : {g_gpu_mode ? g_shared_color : g_color, g_gpu_mode ? g_shared_output : g_output}) {
+		if (resource) {
+			const auto desc = resource->GetDesc();
+			blog(LOG_INFO, "[obs-dlss5-nr] CreateFeature resource: format=%u flags=0x%X size=%llux%u",
+			     (unsigned)desc.Format, (unsigned)desc.Flags, (unsigned long long)desc.Width, desc.Height);
+		}
+	}
+}
+
 static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure,
 			  float skin, int automask, int ui_correction, bool temporal)
 {
@@ -756,6 +811,18 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 		return true;
 	}
 
+	const ngx_diagnostics::CreateKey key{w,
+					     h,
+					     style,
+					     preset,
+					     ui_correction,
+					     temporal,
+					     g_gpu_mode,
+					     g_retry_generation.load(std::memory_order_relaxed)};
+	if (!g_create_retry.allowed(key, GetTickCount64())) {
+		SetError("%s", g_create_error.c_str());
+		return false;
+	}
 	ReleaseFeatureAndResources();
 	if (!g_gpu_mode) {
 		if (!AllocateFrameResources(w, h, temporal))
@@ -768,6 +835,9 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 	// history on the first evaluated frame.
 	SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 1, temporal);
 
+	if (g_diagnostics.load(std::memory_order_relaxed))
+		LogCreateParams(w, h, style, preset, intensity, tone, structure, skin, automask, ui_correction,
+				temporal);
 	NGXResult r;
 	if (g_nr_create && g_shim_create)
 		r = g_shim_create(reinterpret_cast<void *>(g_nr_create), g_cmd.Get(), NR_FEATURE_ID, g_params,
@@ -775,11 +845,22 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 	else
 		r = g_core_create(g_cmd.Get(), NR_FEATURE_ID, g_params, &g_feature);
 	if (r != NGX_SUCCESS || !g_feature) {
+		const char *hint =
+			static_cast<uint32_t>(r) == 0xBAD00001u
+				? "This GPU/driver/runtime combination does not support the feature; this code alone does not identify which component."
+				: "Enable diagnostic logging for creation parameters and module versions.";
 		SetError(
-			"CreateFeature(18) failed: 0x%08X. Check GPU support, driver, nvngx_dlssnr.dll, and caller shim.",
-			static_cast<unsigned>(r));
+			"CreateFeature(18) failed: 0x%08X (%s). %s Retrying at most every 5 s; use Retry Feature to retry now.",
+			static_cast<unsigned>(r),
+			r == NGX_SUCCESS ? "MissingFeatureHandle"
+					 : ngx_diagnostics::result_name(static_cast<uint32_t>(r)),
+			hint);
+		g_create_error = g_last_error;
+		g_create_retry.failure(key, GetTickCount64());
 		return false;
 	}
+	g_create_retry.reset();
+	g_create_error.clear();
 	g_feature_style = style;
 	g_feature_preset = preset;
 	g_feature_ui_correction = ui_correction;
@@ -844,6 +925,8 @@ static bool LoadNGX(const std::wstring &shim_dir)
 	g_nr_eval = reinterpret_cast<EvaluateFeatureFn>(GetProcAddress(g_nr_mod, "NVSDK_NGX_D3D12_EvaluateFeature"));
 	g_nr_release = reinterpret_cast<ReleaseFeatureFn>(GetProcAddress(g_nr_mod, "NVSDK_NGX_D3D12_ReleaseFeature"));
 
+	g_set_log_callback = reinterpret_cast<SetLogCallbackFn>(GetProcAddress(g_shim_mod, "DLSSNR_SetLogCallback"));
+	g_log_proxy = reinterpret_cast<NGXLogCallback>(GetProcAddress(g_shim_mod, "DLSSNR_LogMessage"));
 	g_shim_init = reinterpret_cast<ShimInitFn>(GetProcAddress(g_shim_mod, "DLSSNR_CallInit"));
 	g_shim_create = reinterpret_cast<ShimCreateFn>(GetProcAddress(g_shim_mod, "DLSSNR_CallCreate"));
 	g_shim_eval = reinterpret_cast<ShimEvaluateFn>(GetProcAddress(g_shim_mod, "DLSSNR_CallEvaluate"));
@@ -858,10 +941,12 @@ static bool LoadNGX(const std::wstring &shim_dir)
 		SetError("Required DLSSNR exports are missing from nvngx_dlssnr.dll");
 		return false;
 	}
-	if (!g_shim_init || !g_shim_create || !g_shim_eval || !g_shim_release) {
-		SetError("Required caller shim exports are missing");
+	if (!g_shim_init || !g_shim_create || !g_shim_eval || !g_shim_release || !g_set_log_callback || !g_log_proxy) {
+		SetError(
+			"Required caller shim exports are missing; install the matching plugin and caller shim together");
 		return false;
 	}
+	g_set_log_callback(NGXLog);
 	return true;
 }
 
@@ -871,13 +956,15 @@ static bool InitNGXSession()
 	NGXPathListInfo pli{paths, 1};
 	NGXFeatureCommonInfo fci{};
 	fci.PathListInfo = pli;
-	fci.LoggingInfo.LoggingLevel = NGX_LOG_OFF;
+	fci.LoggingInfo.Callback = g_log_proxy;
+	fci.LoggingInfo.LoggingLevel = g_diagnostics.load() ? NGX_LOG_VERBOSE : NGX_LOG_OFF;
+	fci.LoggingInfo.DisableOtherLoggingSinks = true;
 
 	bool core_ok = false;
 	if (g_core_init_project) {
 		for (int ver = 0x13; ver <= 0x20 && !core_ok; ++ver) {
 			NGXResult r = g_core_init_project(PROJECT_ID, 0, "0.4.0", g_runtime_dir.c_str(), g_device.Get(),
-							  ver, nullptr);
+							  ver, &fci);
 			core_ok = (r == NGX_SUCCESS);
 		}
 	}
@@ -909,6 +996,10 @@ static bool InitNGXSession()
 
 static void ShutdownUnlocked()
 {
+	if (g_set_log_callback)
+		g_set_log_callback(nullptr); // Drain callbacks before this plugin can unload.
+	g_create_retry.reset();
+	g_create_error.clear();
 	ReleaseFeatureAndResources();
 	ReleaseSharedState();
 	// The OFA session is driver state but not NGX/D3D12-UMD state; the public
@@ -922,6 +1013,7 @@ static void ShutdownUnlocked()
 	g_cmd_alloc.Reset();
 	g_cmd.Reset();
 	g_fence.Reset();
+	g_adapter.Reset(); // Release DXGI references before DLL/process-detach loader lock.
 	// The NGX core and the NR runtime own driver worker threads and live D3D12
 	// state. Unloading them here deadlocks inside the NVIDIA D3D12 UMD:
 	// FreeLibrary(g_nr_mod) never returns, which wedges the OBS destroy queue
@@ -942,6 +1034,8 @@ static void ShutdownUnlocked()
 	g_nr_eval = nullptr;
 	g_nr_release = nullptr;
 	g_shim_init = nullptr;
+	g_set_log_callback = nullptr;
+	g_log_proxy = nullptr;
 	g_shim_create = nullptr;
 	g_shim_eval = nullptr;
 	g_shim_release = nullptr;
@@ -1019,7 +1113,22 @@ bool init(int gpu_index, const wchar_t *runtime_dir, const wchar_t *shim_dir)
 		return false;
 	}
 	g_initialized = true;
+	if (g_diagnostics.load()) {
+		LogModule("NGX core", g_core_mod);
+		LogModule("NR runtime", g_nr_mod);
+		LogModule("caller shim", g_shim_mod);
+	}
 	return true;
+}
+
+void set_diagnostics(bool enabled)
+{
+	g_diagnostics.store(enabled, std::memory_order_relaxed);
+}
+
+void request_retry()
+{
+	g_retry_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int dst_row_pitch, int width, int height,
@@ -1120,7 +1229,8 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 
 	NGXResult er = g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
 	if (er != NGX_SUCCESS) {
-		SetError("DLSSNR EvaluateFeature failed: 0x%08X", static_cast<unsigned>(er));
+		SetError("DLSSNR EvaluateFeature failed: 0x%08X (%s)", static_cast<unsigned>(er),
+			 ngx_diagnostics::result_name(static_cast<uint32_t>(er)));
 		ExecuteAndWait(); // reset the command list to a clean state
 		return false;
 	}
@@ -1376,7 +1486,8 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	NGXResult er = g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
 	g_cmd->ResourceBarrier(2, toCommon);
 	if (er != NGX_SUCCESS) {
-		SetError("DLSSNR EvaluateFeature failed: 0x%08X", static_cast<unsigned>(er));
+		SetError("DLSSNR EvaluateFeature failed: 0x%08X (%s)", static_cast<unsigned>(er),
+			 ngx_diagnostics::result_name(static_cast<uint32_t>(er)));
 		ExecuteAndWait(); // reset the command list to a clean state
 		return false;
 	}

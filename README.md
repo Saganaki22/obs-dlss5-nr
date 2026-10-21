@@ -2,10 +2,10 @@
 
 **Unofficial DLSS 5 Neural Rendering filter for OBS Studio** — runs NVIDIA DLSS 5 NR (NGX feature 18) on any video source (Game Capture, Media Source, Webcam, …) with a **Default / Natural / Cinematic** style selector.
 
-> ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
-> This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
+> ⚠️ **Windows x64. NVIDIA currently officially supports DLSS 5 Neural Rendering on RTX 50-series.** Older RTX generations are not verified with this plugin and an unmodified runtime. Linux/macOS builds compile as no-ops.
+> This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Features (v1.2.5)
+## Features (v1.3.0)
 
 - DLSS 5 Neural Rendering on any OBS video source, live
 - **Style**: Default / Natural / Cinematic (rebuilds the NR feature on change)
@@ -19,6 +19,8 @@
 - **Live performance status** — actual enhanced FPS, processing dimensions, path, and last processing time in the Status field and periodic OBS logs. Reopen filter properties to refresh the Status snapshot.
 - **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps in both processing modes; between NR frames the last enhanced frame is displayed (a performance dial)
 - **Reset History** button (fixes smearing after scene cuts)
+- **Troubleshooting controls** — Advanced → Diagnostic logging and Retry Feature Now; readable NGX result names and throttled failure logs in both processing modes
+- **Feature creation cooldown** — unchanged failed creation settings retry at most every five seconds, with immediate retry on a creation-setting change or manual request
 - Clean shutdown — the NGX modules are left mapped for process lifetime (unloading them deadlocked inside the NVIDIA D3D12 driver); OBS exits normally
 - Advanced: GPU Index, Channel Order (auto-detects runtime BGRA/RGBA quirks), experimental zero-copy toggle (off by default — see status)
 - Fail-safe design: any NGX/runtime error falls back to clean pass-through video and is reported in the filter's Status line
@@ -105,21 +107,35 @@ The NGX core (`_nvngx.dll`) is not copied by hand — the plugin discovers it au
 
 ## GPU / runtime compatibility
 
-DLSS NR support is decided by the `nvngx_dlssnr.dll` build you supply — the plugin relays the runtime's verdict to the Status line and falls back to clean pass-through video when a GPU is rejected.
+The plugin ships as one generic Windows x64 binary. **That does not make NVIDIA's NR runtime support every RTX GPU.** Actual availability depends on the runtime, GPU, driver, and graphics API.
 
-The release is **one generic Windows x64 ZIP** for all runtime-supported RTX GPUs, with no 5090-only compiler target or GPU-generation allowlist. Only the RTX 5090 was hardware-tested for 1.2.5; support on other generations remains dependent on NVIDIA's runtime and driver.
+As of October 21, 2026, [NVIDIA's hardware support table](https://www.nvidia.com/en-us/geforce/technologies/dlss/) lists **DLSS 3D-Guided Neural Rendering for RTX 50-series**. [NVIDIA's DLSS 5 FAQ](https://www.nvidia.com/en-us/geforce/forums/nvidia-app/129/583738/dlss-5-faq-932026/) describes RTX 40-series support as planned.
 
-The community-standard **310.8 runtime** (the build everyone ships, including the DLSS5-Swapper project) reports support across the full RTX lineup:
+| GPU | Status with this plugin and an unmodified NR runtime |
+| --- | --- |
+| RTX 50-series | RTX 5090 tested locally; NVIDIA officially lists 50-series support |
+| RTX 40-series | Unverified; RTX 4080 Laptop + 310.9.16 + driver 617.42 reports FeatureNotSupported |
+| RTX 30/20-series | Unverified; not in NVIDIA's current official Neural Rendering support table |
+| Older / non-RTX / AMD / Intel | Not supported by this integration |
 
-| GPU | Status |
-|---|---|
-| RTX 50xx | ✅ Verified (development and testing happen on a 5090) |
-| RTX 40xx | Reported working with the standard 310.8 runtime |
-| RTX 30xx | Reported working with the standard 310.8 runtime |
-| RTX 20xx | Reported working with the standard 310.8 runtime |
-| Older / non-RTX / AMD / Intel | Not supported |
+[Issue #2](https://github.com/Saganaki22/obs-dlss5-nr/issues/2) reports that the same 310.9.16 runtime works on an RTX 5090 with driver 616.92 but fails creation on an RTX 4080 Laptop with driver 617.42. This is consistent with a support limitation, but the two machines also differ in driver and system configuration. It does not prove which single component caused the rejection.
 
-"Reported" = per the community projects that ship this runtime; we've only verified 50-series ourselves. If the Status line shows `0xBAD00001`, your runtime build does not support your GPU/driver combination — try a different build.
+Earlier README versions repeated community claims about 310.8 on older GPUs. Those were not verified with this plugin and an unmodified runtime and should not be treated as confirmed compatibility. We have no verified stock runtime recommendation for RTX 40-series with this plugin. Results from modified runtimes or other integrations do not establish support here.
+
+## Troubleshooting feature creation (1.3.0)
+
+`0xBAD00001` is NVIDIA's **FeatureNotSupported** result: the feature is unsupported by the current system, hardware, and/or graphics API. It is distinct from InvalidParameter, OutOfDate, OutOfGPUMemory, and Denied. See [NVIDIA's NGX result definitions](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h).
+
+Both Smooth and Low latency modes write processing failures to the OBS log, at most once every five seconds. Failed feature creation with unchanged creation settings also waits five seconds before another actual CreateFeature call; video passes through during failure. Changing resolution, style, preset, Temporal setting or processing path, or clicking **Advanced → Retry Feature Now**, allows an immediate creation attempt. The cooldown does not prevent retrying a different configuration.
+
+To collect a useful diagnostic log:
+
+1. Enable **Advanced → Diagnostic logging** on the filter.
+2. Restart OBS to request verbose NGX logs during initialization. Creation-parameter logging can be enabled immediately; NGX verbosity is selected when its session starts.
+3. Reproduce the problem, then collect the OBS log. It includes runtime/core/shim paths, file versions and byte counts, adapter identifiers and driver version, processing dimensions, creation settings, and resource formats/flags.
+4. Disable the option after collecting the log. Forwarding stops immediately; restart OBS to return NGX's initialization verbosity to its default. Local DLL paths appear in diagnostic logs, so review those before sharing.
+
+The NGX logging structure now matches the documented callback/level/disable-sinks layout. Diagnostics help distinguish failures; **1.3.0 does not add or claim RTX 40-series support**.
 
 ## Building from source
 
@@ -134,7 +150,7 @@ Non-Windows platforms build an empty module (the filter only registers on `_WIN3
 
 ## Releases
 
-Semantic-version tags (for example `1.2.5`) trigger the Windows-only build and regression tests. The release workflow uses **curl** to create a draft with versioned patch notes and a checksum, attaching only the Windows x64 ZIP. The ZIP includes the README, license, and patch notes. GitHub also displays its automatic source-code links. See [release instructions](docs/RELEASING.md).
+Semantic-version tags (for example `v1.3.0`) trigger the Windows-only build and regression tests. The release workflow uses **curl** to create a draft with versioned patch notes and a checksum, attaching only the Windows x64 ZIP. The ZIP includes the README, license, and patch notes. GitHub also displays its automatic source-code links. See [release instructions](docs/RELEASING.md).
 
 ## License
 

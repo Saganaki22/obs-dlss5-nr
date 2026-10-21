@@ -47,6 +47,12 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 // input texture. Blocks until the GPU finished writing the output texture.
 bool process_gpu(int width, int height, const NrBridgeParams &params);
 
+// Verbose NGX logging is selected at init; restart OBS after enabling it.
+// Creation diagnostics and disabling log forwarding apply immediately.
+void set_diagnostics(bool enabled);
+// Nonblocking: bypass a failed creation's cooldown on the next processing call.
+void request_retry();
+
 void shutdown();
 bool ready();
 const char *gpu_name();

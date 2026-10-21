@@ -69,7 +69,9 @@ struct dlss5nr_filter {
 	// Bridge lifecycle / status.
 	bool init_attempted = false;
 	uint64_t last_init_attempt = 0;
-	uint64_t last_error_log = 0;
+	std::atomic<uint64_t> last_error_log{0};
+	std::atomic<bool> processing_failed{false};
+	bool diagnostics = false;
 	std::mutex status_mutex;
 	std::string status_text;
 
@@ -135,6 +137,8 @@ struct dlss5nr_filter {
 
 static std::atomic<int> g_bridge_users{0};
 
+static void log_error_throttled(dlss5nr_filter *f, const char *err);
+
 // ------------------------------------------------------------ async worker
 
 static void async_worker(dlss5nr_filter *f)
@@ -159,8 +163,12 @@ static void async_worker(dlss5nr_filter *f)
 						  (int)job.w, (int)job.h, job.params);
 
 		f->process_ms.store((os_gettime_ns() - begin_ns) / 1000000.0);
-		if (!ok)
-			f->set_status("NR failed: %s", nrbridge::last_error());
+		f->processing_failed.store(!ok);
+		if (!ok) {
+			const std::string error = nrbridge::last_error();
+			f->set_status("NR failed: %s", error.c_str());
+			log_error_throttled(f, error.c_str());
+		}
 		std::lock_guard<std::mutex> lock(f->result_mutex);
 		if (ok) {
 			f->result.pixels = std::move(out);
@@ -205,6 +213,7 @@ static void clear_completed_frames(dlss5nr_filter *f)
 		f->result.pixels.clear();
 	}
 	f->drawn_seq = 0;
+	f->processing_failed.store(false);
 	f->cached_frame = false;
 	f->last_render_ns = 0;
 	f->limiter.reset();
@@ -363,9 +372,11 @@ static bool ensure_bridge_ready(dlss5nr_filter *f)
 static void log_error_throttled(dlss5nr_filter *f, const char *err)
 {
 	const uint64_t now = os_gettime_ns();
-	if (now - f->last_error_log < LOG_THROTTLE_NS)
+	uint64_t previous = f->last_error_log.load(std::memory_order_relaxed);
+	if (previous && now - previous < LOG_THROTTLE_NS)
 		return;
-	f->last_error_log = now;
+	if (!f->last_error_log.compare_exchange_strong(previous, now, std::memory_order_relaxed))
+		return;
 	blog(LOG_WARNING, "[obs-dlss5-nr] NR processing failed, passing through: %s", err);
 }
 
@@ -720,6 +731,9 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 		}
 	}
 
+	if (f->processing_failed.load())
+		return false; // Failed processing always falls back to live pass-through.
+
 	// Draw the newest completed result; keep drawing it while a newer one
 	// is in flight (and between throttled submissions) so the output never
 	// flickers between NR and raw.
@@ -798,6 +812,7 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 				processed = process_cpu_path(f, parent, context, cx, cy);
 			}
 			f->process_ms.store((os_gettime_ns() - begin_ns) / 1000000.0);
+			f->processing_failed.store(!processed);
 			if (processed)
 				++f->presented_frames;
 		}
@@ -811,7 +826,7 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 		f->perf_start_ns = now;
 	if (now - f->perf_start_ns >= LOG_THROTTLE_NS) {
 		const double fps = f->presented_frames * 1000000000.0 / (now - f->perf_start_ns);
-		if (f->presented_frames) {
+		if (f->presented_frames && !f->processing_failed.load()) {
 			char perf[256];
 			snprintf(perf, sizeof(perf), "%s | %s | NR %ux%u | enhanced %.1f FPS | last processing %.1f ms",
 				 f->using_gpu ? "GPU sharing" : "CPU staging", f->async_mode ? "Smooth" : "Low latency",
@@ -847,6 +862,12 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->ui_correction = 0;
 	f->gpu_index = (int)obs_data_get_int(settings, "gpu_index");
 	f->channel_order = (int)obs_data_get_int(settings, "channel_order");
+	const bool diagnostics = obs_data_get_bool(settings, "diagnostics");
+	if (diagnostics != f->diagnostics)
+		blog(LOG_INFO, "[obs-dlss5-nr] diagnostic logging %s; restart OBS to change NGX verbosity",
+		     diagnostics ? "enabled" : "disabled");
+	f->diagnostics = diagnostics;
+	nrbridge::set_diagnostics(diagnostics);
 	const bool new_async = obs_data_get_bool(settings, "async_mode");
 	const bool new_gpu = obs_data_get_bool(settings, "gpu_zero_copy");
 	uint32_t new_height = (uint32_t)obs_data_get_int(settings, "processing_height");
@@ -883,6 +904,16 @@ static bool dlss5nr_reset_history_cb(obs_properties_t *props, obs_property_t *pr
 	f->reset_pending = true;
 	blog(LOG_INFO, "[obs-dlss5-nr] history reset requested");
 	return false;
+}
+
+static bool dlss5nr_retry_cb(obs_properties_t *, obs_property_t *, void *data)
+{
+	auto *f = static_cast<dlss5nr_filter *>(data);
+	nrbridge::request_retry();
+	f->last_error_log.store(0);
+	f->set_status("Retry requested — waiting for the next processing frame");
+	blog(LOG_INFO, "[obs-dlss5-nr] manual feature retry requested");
+	return true;
 }
 
 static obs_properties_t *dlss5nr_properties(void *data)
@@ -928,6 +959,10 @@ static obs_properties_t *dlss5nr_properties(void *data)
 	obs_property_set_long_description(temporal, obs_module_text("Temporal.Tip"));
 
 	obs_properties_t *advanced = obs_properties_create();
+
+	obs_property_t *diagnostics = obs_properties_add_bool(advanced, "diagnostics", obs_module_text("Diagnostics"));
+	obs_property_set_long_description(diagnostics, obs_module_text("Diagnostics.Tip"));
+	obs_properties_add_button(advanced, "retry_feature", obs_module_text("RetryFeature"), dlss5nr_retry_cb);
 
 	obs_properties_add_int(advanced, "gpu_index", obs_module_text("GPUIndex"), 0, 15, 1);
 
@@ -984,6 +1019,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "temporal", false);
 	obs_data_set_default_int(settings, "gpu_index", 0);
 	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
+	obs_data_set_default_bool(settings, "diagnostics", false);
 	obs_data_set_default_bool(settings, "async_mode", true);
 	obs_data_set_default_int(settings, "nr_fps", 0);
 	obs_data_set_default_int(settings, "processing_height", 1080);

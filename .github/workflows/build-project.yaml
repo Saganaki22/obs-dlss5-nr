@@ -34,7 +34,7 @@ jobs:
         run: cmake --preset windows-ci-x64 -DENABLE_PERFORMANCE_TESTS=ON -DENABLE_GPU_SMOKE_TEST=OFF
       - name: Build
         run: cmake --build --preset windows-x64 --config Release --parallel
-      - name: Test frame pacing and processing sizes
+      - name: Test frame pacing and NGX diagnostics
         run: ctest --test-dir build_x64 -C Release --output-on-failure
       - name: Stage plugin
         run: cmake --install build_x64 --prefix release/Release --config Release

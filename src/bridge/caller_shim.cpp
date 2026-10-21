@@ -17,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#include "ngx-diagnostics.h"
 
 using NGXResult = int;
 
@@ -32,6 +33,8 @@ using ReleaseFn = NGXResult(__cdecl *)(NGXHandle *);
 using ShutdownFn = NGXResult(__cdecl *)();
 
 static volatile LONG g_post_call_sink = 0;
+static SRWLOCK g_log_lock = SRWLOCK_INIT;
+static NGXLogCallback g_log_callback = nullptr;
 
 static __forceinline NGXResult FinishCall(NGXResult r)
 {
@@ -40,6 +43,24 @@ static __forceinline NGXResult FinishCall(NGXResult r)
 }
 
 extern "C" {
+
+// The shim remains mapped for the process lifetime. NGX can retain this
+// trampoline through teardown without retaining a pointer into an unloaded
+// OBS plugin. Clearing the consumer waits for callbacks already in flight.
+__declspec(dllexport) void __cdecl DLSSNR_SetLogCallback(NGXLogCallback callback)
+{
+	AcquireSRWLockExclusive(&g_log_lock);
+	g_log_callback = callback;
+	ReleaseSRWLockExclusive(&g_log_lock);
+}
+
+__declspec(dllexport) void __cdecl DLSSNR_LogMessage(const char *message, NGXLoggingLevel level, int component)
+{
+	AcquireSRWLockShared(&g_log_lock);
+	if (g_log_callback)
+		g_log_callback(message, level, component);
+	ReleaseSRWLockShared(&g_log_lock);
+}
 
 __declspec(dllexport)
 __declspec(noinline) NGXResult __cdecl DLSSNR_CallInit(void *real_fn, unsigned long long app_id, const wchar_t *path,

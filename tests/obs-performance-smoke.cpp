@@ -1,5 +1,8 @@
 // Run against an installed OBS runtime, using a synthetic animated 4K source.
 // No user's scene collection or capture device is opened or changed.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #include <obs.h>
 #include <graphics/vec4.h>
 #include <algorithm>
@@ -111,10 +114,11 @@ int main(int argc, char **argv)
 	obs_source_t *pattern = obs_source_create_private(source.id, "4K pattern", nullptr);
 	obs_data_t *settings = obs_data_create();
 	const int scenario = std::atoi(argv[4]);
-	obs_data_set_bool(settings, "async_mode", scenario != 0 && scenario != 3);
+	obs_data_set_bool(settings, "async_mode", scenario != 0 && scenario != 3 && scenario != 7);
 	obs_data_set_bool(settings, "temporal", scenario == 0 || scenario == 2 || scenario == 5);
 	obs_data_set_int(settings, "processing_height", scenario == 0 ? 0 : scenario == 5 ? 720 : 1080);
 	obs_data_set_int(settings, "nr_fps", 30);
+	obs_data_set_bool(settings, "diagnostics", scenario >= 6);
 	obs_source_t *filter = obs_source_create_private("obs-dlss5-nr-filter", "NR smoke", settings);
 	if (!filter || !pattern)
 		return 6;
@@ -144,6 +148,31 @@ int main(int argc, char **argv)
 	const bool enhanced = status.find("enhanced") != std::string::npos;
 	obs_data_release(current);
 	bool switches_ok = true;
+	if (scenario == 6 || scenario == 7) {
+		// This run uses fake-nr-runtime.dll copied under an isolated config root.
+		// The plugin must report unsupported and keep the animated input live.
+		switches_ok = status.find("FeatureNotSupported") != std::string::npos;
+		auto count = reinterpret_cast<unsigned(__cdecl *)()>(
+			GetProcAddress(GetModuleHandleW(L"nvngx_dlssnr.dll"), "NRTest_GetCreateCount"));
+		const unsigned initial_count = count ? count() : 0;
+		switches_ok &= initial_count >= 3 && initial_count <= 4;
+		props = obs_source_properties(filter);
+		auto *retry = obs_properties_get(props, "retry_feature");
+		switches_ok &= retry && obs_property_button_clicked(retry, filter);
+		obs_properties_destroy(props);
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		const unsigned manual_count = count ? count() : 0;
+		switches_ok &= manual_count > initial_count && manual_count <= initial_count + 2;
+		obs_data_set_int(settings, "style", 2);
+		obs_source_update(filter, settings);
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		const unsigned style_count = count ? count() : 0;
+		switches_ok &= style_count == manual_count + 1;
+		std::printf("CREATION-COUNTS initial=%u manual=%u style=%u\n", initial_count, manual_count,
+			    style_count);
+		std::printf("FAILURE-PATH unsupported=%d pass-through-changes=%llu\n", switches_ok,
+			    (unsigned long long)changes);
+	}
 	if (scenario == 4) {
 		// Repeated resize/mode changes must not publish stale or empty textures.
 		for (int height : {720, 1440, 2160, 0, 1080}) {
@@ -173,8 +202,13 @@ int main(int argc, char **argv)
 	obs_source_release(pattern);
 	obs_data_release(settings);
 	obs_shutdown();
-	const bool rate_ok = (scenario == 1 || scenario == 5) ? changes >= 270 : changes >= 20;
-	return frames >= 100 && light == frames && rate_ok && dropdown_ok && switches_ok && (enhanced || scenario == 0)
-		       ? 0
-		       : 7;
+	const bool failure_test = scenario == 6 || scenario == 7;
+	const bool rate_ok = (scenario == 1 || scenario == 5 || failure_test) ? changes >= 270 : changes >= 20;
+	const int exit_code = frames >= 100 && light == frames && rate_ok && dropdown_ok && switches_ok &&
+					      (enhanced || scenario == 0 || failure_test)
+				      ? 0
+				      : 7;
+	std::printf("SMOKE-EXIT %d\n", exit_code);
+	std::fflush(stdout);
+	return exit_code;
 }
