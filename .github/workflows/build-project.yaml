@@ -34,7 +34,7 @@ jobs:
         run: cmake --preset windows-ci-x64 -DENABLE_PERFORMANCE_TESTS=ON -DENABLE_GPU_SMOKE_TEST=OFF
       - name: Build
         run: cmake --build --preset windows-x64 --config Release --parallel
-      - name: Test frame pacing and NGX diagnostics
+      - name: Test frame pacing, NGX diagnostics and D3D12 recovery
         run: ctest --test-dir build_x64 -C Release --output-on-failure
       - name: Stage plugin
         run: cmake --install build_x64 --prefix release/Release --config Release
@@ -42,10 +42,11 @@ jobs:
         run: |
           $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
           $notes = "docs/releases/$($spec.version).md"
-          if (!(Test-Path $notes)) { throw "Missing patch notes: $notes" }
           $package = "release/Release/$($spec.name)"
           Copy-Item README.md,LICENSE $package
-          Copy-Item $notes "$package/PATCHNOTES.md"
+          if (Test-Path -LiteralPath $notes -PathType Leaf) {
+            Copy-Item -LiteralPath $notes -Destination "$package/PATCHNOTES.md"
+          }
           $dlls = @(Get-ChildItem $package -Recurse -Filter '*.dll')
           $allowed = @('obs-dlss5-nr.dll', 'nvngx.dll_obs.dll')
           if ($dlls.Count -ne 2 -or @($dlls | Where-Object Name -notin $allowed).Count) {

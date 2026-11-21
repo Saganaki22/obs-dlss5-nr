@@ -54,6 +54,7 @@ void set_diagnostics(bool enabled);
 void request_retry();
 
 void shutdown();
+void finalize_shutdown();
 bool ready();
 const char *gpu_name();
 const char *last_error();

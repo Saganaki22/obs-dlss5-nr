@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "d3d12-commands.h"
 #include "nr_bridge.h"
 #include "nvof_flow.h"
 #include "ngx-diagnostics.h"
@@ -119,11 +120,10 @@ static ShimEvaluateFn g_shim_eval = nullptr;
 static ShimReleaseFn g_shim_release = nullptr;
 
 static ComPtr<ID3D12Device> g_device;
-static ComPtr<ID3D12CommandQueue> g_queue;
-static ComPtr<ID3D12CommandAllocator> g_cmd_alloc;
-static ComPtr<ID3D12GraphicsCommandList> g_cmd;
-static ComPtr<ID3D12Fence> g_fence;
-static UINT64 g_fence_value = 0;
+static D3D12Commands g_commands;
+static bool g_shutdown_pending = false;
+static bool g_finalized = false;
+static bool g_detach_pending = false;
 
 static NGXParameter *g_params = nullptr;
 static NGXHandle *g_feature = nullptr;
@@ -360,23 +360,8 @@ static bool SetupD3D12()
 		return false;
 	}
 
-	D3D12_COMMAND_QUEUE_DESC q{};
-	q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	if (FAILED(g_device->CreateCommandQueue(&q, IID_PPV_ARGS(&g_queue)))) {
-		SetError("CreateCommandQueue failed");
-		return false;
-	}
-	if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_cmd_alloc)))) {
-		SetError("CreateCommandAllocator failed");
-		return false;
-	}
-	if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_cmd_alloc.Get(), nullptr,
-					       IID_PPV_ARGS(&g_cmd)))) {
-		SetError("CreateCommandList failed");
-		return false;
-	}
-	if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) {
-		SetError("CreateFence failed");
+	if (!g_commands.initialize(g_device.Get())) {
+		SetError("%s", g_commands.error().c_str());
 		return false;
 	}
 	return true;
@@ -384,51 +369,10 @@ static bool SetupD3D12()
 
 static bool ExecuteAndWait()
 {
-	HRESULT hr = g_cmd->Close();
-	if (FAILED(hr)) {
-		SetError("CommandList::Close failed (0x%08X)", static_cast<unsigned>(hr));
-		return false;
-	}
-	ID3D12CommandList *lists[] = {g_cmd.Get()};
-	g_queue->ExecuteCommandLists(1, lists);
-	++g_fence_value;
-	hr = g_queue->Signal(g_fence.Get(), g_fence_value);
-	if (FAILED(hr)) {
-		SetError("Queue::Signal failed (0x%08X)", static_cast<unsigned>(hr));
-		return false;
-	}
-	if (g_fence->GetCompletedValue() < g_fence_value) {
-		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-		if (!ev) {
-			SetError("CreateEvent failed");
-			return false;
-		}
-		g_fence->SetEventOnCompletion(g_fence_value, ev);
-		DWORD w = WaitForSingleObject(ev, FENCE_TIMEOUT_MS);
-		CloseHandle(ev);
-		if (w != WAIT_OBJECT_0) {
-			SetError("Timed out waiting for DLSS NR GPU work (%u ms)", FENCE_TIMEOUT_MS);
-			return false;
-		}
-	}
-	g_cmd_alloc->Reset();
-	g_cmd->Reset(g_cmd_alloc.Get(), nullptr);
-	return true;
-}
-
-static void WaitQueueIdle()
-{
-	if (!g_queue || !g_fence)
-		return;
-	++g_fence_value;
-	if (SUCCEEDED(g_queue->Signal(g_fence.Get(), g_fence_value)) && g_fence->GetCompletedValue() < g_fence_value) {
-		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-		if (ev) {
-			g_fence->SetEventOnCompletion(g_fence_value, ev);
-			WaitForSingleObject(ev, FENCE_TIMEOUT_MS);
-			CloseHandle(ev);
-		}
-	}
+	if (g_commands.execute_and_wait(FENCE_TIMEOUT_MS))
+		return true;
+	SetError("%s", g_commands.error().c_str());
+	return false;
 }
 
 static D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -580,7 +524,7 @@ static bool UploadMotionVectorTexture(const NvofFlowFrame *flow, bool execute_no
 
 	auto to_copy =
 		Barrier(g_mvec.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-	g_cmd->ResourceBarrier(1, &to_copy);
+	g_commands.list()->ResourceBarrier(1, &to_copy);
 
 	D3D12_TEXTURE_COPY_LOCATION dst{};
 	dst.pResource = g_mvec.Get();
@@ -594,18 +538,18 @@ static bool UploadMotionVectorTexture(const NvofFlowFrame *flow, bool execute_no
 	src.PlacedFootprint.Footprint.Height = g_height;
 	src.PlacedFootprint.Footprint.Depth = 1;
 	src.PlacedFootprint.Footprint.RowPitch = g_mvec_row_pitch;
-	g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	g_commands.list()->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
 	auto to_read =
 		Barrier(g_mvec.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	g_cmd->ResourceBarrier(1, &to_read);
+	g_commands.list()->ResourceBarrier(1, &to_read);
 
 	return !execute_now || ExecuteAndWait();
 }
 
+// Caller has confirmed all submitted work is drained.
 static void ReleaseFeatureAndResources()
 {
-	WaitQueueIdle();
 	if (g_feature) {
 		if (g_nr_release && g_shim_release)
 			g_shim_release(reinterpret_cast<void *>(g_nr_release), g_feature);
@@ -633,6 +577,26 @@ static void ReleaseFeatureAndResources()
 	g_feature_preset = -999;
 	g_feature_ui_correction = -999;
 	g_feature_motion = -1;
+}
+
+// Shared relay textures may still be in use after OBS has discarded its views.
+// Keep the bridge's references until the submission has finished.
+static void FinishSharedDetach()
+{
+	ReleaseFeatureAndResources();
+	ReleaseSharedState();
+	g_detach_pending = false;
+}
+
+static bool PrepareCommands()
+{
+	if (!g_commands.prepare()) {
+		SetError("%s", g_commands.error().c_str());
+		return false;
+	}
+	if (g_detach_pending)
+		FinishSharedDetach();
+	return true;
 }
 
 static bool AllocateFrameResources(UINT w, UINT h, bool temporal)
@@ -840,10 +804,10 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 				temporal);
 	NGXResult r;
 	if (g_nr_create && g_shim_create)
-		r = g_shim_create(reinterpret_cast<void *>(g_nr_create), g_cmd.Get(), NR_FEATURE_ID, g_params,
+		r = g_shim_create(reinterpret_cast<void *>(g_nr_create), g_commands.list(), NR_FEATURE_ID, g_params,
 				  &g_feature);
 	else
-		r = g_core_create(g_cmd.Get(), NR_FEATURE_ID, g_params, &g_feature);
+		r = g_core_create(g_commands.list(), NR_FEATURE_ID, g_params, &g_feature);
 	if (r != NGX_SUCCESS || !g_feature) {
 		const char *hint =
 			static_cast<uint32_t>(r) == 0xBAD00001u
@@ -994,10 +958,17 @@ static bool InitNGXSession()
 	return true;
 }
 
-static void ShutdownUnlocked()
+static bool ShutdownUnlocked()
 {
+	g_initialized = false;
 	if (g_set_log_callback)
 		g_set_log_callback(nullptr); // Drain callbacks before this plugin can unload.
+	if (!g_commands.drained()) {
+		g_shutdown_pending = true;
+		return false;
+	}
+	g_shutdown_pending = false;
+	g_detach_pending = false;
 	g_create_retry.reset();
 	g_create_error.clear();
 	ReleaseFeatureAndResources();
@@ -1008,11 +979,8 @@ static void ShutdownUnlocked()
 	if (g_core_shutdown)
 		g_core_shutdown();
 	g_params = nullptr;
+	g_commands.clear();
 	g_device.Reset();
-	g_queue.Reset();
-	g_cmd_alloc.Reset();
-	g_cmd.Reset();
-	g_fence.Reset();
 	g_adapter.Reset(); // Release DXGI references before DLL/process-detach loader lock.
 	// The NGX core and the NR runtime own driver worker threads and live D3D12
 	// state. Unloading them here deadlocks inside the NVIDIA D3D12 UMD:
@@ -1040,7 +1008,7 @@ static void ShutdownUnlocked()
 	g_shim_eval = nullptr;
 	g_shim_release = nullptr;
 
-	g_initialized = false;
+	return true;
 }
 
 // Some runtime builds return R,G,B,A in the output slots, others B,G,R,A.
@@ -1089,8 +1057,16 @@ bool init(int gpu_index, const wchar_t *runtime_dir, const wchar_t *shim_dir)
 {
 	std::lock_guard<std::mutex> guard(g_mutex);
 	g_last_error.clear();
+	if (g_finalized) {
+		SetError("DLSS NR module is unloading");
+		return false;
+	}
 	if (g_initialized)
 		return true;
+	if (g_shutdown_pending && !ShutdownUnlocked()) {
+		SetError("Previous DLSS NR GPU submission is still pending; initialization deferred");
+		return false;
+	}
 	if (!runtime_dir || !*runtime_dir) {
 		SetError("runtime_dir is empty");
 		return false;
@@ -1140,6 +1116,8 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 		SetError("NR bridge is not initialized");
 		return false;
 	}
+	if (!PrepareCommands())
+		return false;
 	// The two paths use mutually exclusive resources; a shared-texture
 	// attach means the staging buffers do not exist.
 	if (g_gpu_mode) {
@@ -1210,7 +1188,7 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 
 	auto b1 =
 		Barrier(g_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-	g_cmd->ResourceBarrier(1, &b1);
+	g_commands.list()->ResourceBarrier(1, &b1);
 	D3D12_TEXTURE_COPY_LOCATION dst{};
 	dst.pResource = g_color.Get();
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1222,12 +1200,13 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 	src.PlacedFootprint.Footprint.Height = height;
 	src.PlacedFootprint.Footprint.Depth = 1;
 	src.PlacedFootprint.Footprint.RowPitch = g_row_pitch;
-	g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	g_commands.list()->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 	auto b2 =
 		Barrier(g_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	g_cmd->ResourceBarrier(1, &b2);
+	g_commands.list()->ResourceBarrier(1, &b2);
 
-	NGXResult er = g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
+	NGXResult er =
+		g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_commands.list(), g_feature, g_params, nullptr);
 	if (er != NGX_SUCCESS) {
 		SetError("DLSSNR EvaluateFeature failed: 0x%08X (%s)", static_cast<unsigned>(er),
 			 ngx_diagnostics::result_name(static_cast<uint32_t>(er)));
@@ -1236,7 +1215,7 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 	}
 
 	auto b3 = Barrier(g_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	g_cmd->ResourceBarrier(1, &b3);
+	g_commands.list()->ResourceBarrier(1, &b3);
 	D3D12_TEXTURE_COPY_LOCATION rd{};
 	rd.pResource = g_readback.Get();
 	rd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -1248,9 +1227,9 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 	D3D12_TEXTURE_COPY_LOCATION rs{};
 	rs.pResource = g_output.Get();
 	rs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	g_cmd->CopyTextureRegion(&rd, 0, 0, 0, &rs, nullptr);
+	g_commands.list()->CopyTextureRegion(&rd, 0, 0, 0, &rs, nullptr);
 	auto b4 = Barrier(g_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-	g_cmd->ResourceBarrier(1, &b4);
+	g_commands.list()->ResourceBarrier(1, &b4);
 
 	if (!ExecuteAndWait())
 		return false;
@@ -1294,12 +1273,14 @@ bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t
 		SetError("attach_shared: invalid arguments");
 		return false;
 	}
+	if (!PrepareCommands())
+		return false;
 	if (g_gpu_mode && g_shared_w == width && g_shared_h == height) {
 		*out_handle = 0; // caller already has it
 		return true;
 	}
 
-	ReleaseSharedState();
+	FinishSharedDetach();
 
 	ComPtr<IDXGIAdapter1> adapter = FindAdapter(g_gpu_index);
 	if (!adapter) {
@@ -1422,15 +1403,24 @@ bool gpu_mode()
 void detach_shared()
 {
 	std::lock_guard<std::mutex> guard(g_mutex);
-	ReleaseFeatureAndResources();
-	ReleaseSharedState();
+	if (!g_initialized)
+		return;
+	g_detach_pending = true;
+	if (g_commands.drained())
+		FinishSharedDetach();
 }
 
 bool process_gpu(int width, int height, const NrBridgeParams &params)
 {
 	std::lock_guard<std::mutex> guard(g_mutex);
 	g_last_error.clear();
-	if (!g_initialized || !g_gpu_mode) {
+	if (!g_initialized) {
+		SetError("NR bridge is not initialized");
+		return false;
+	}
+	if (!PrepareCommands())
+		return false;
+	if (!g_gpu_mode) {
 		SetError("GPU path not active");
 		return false;
 	}
@@ -1480,11 +1470,12 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 			D3D12_RESOURCE_STATE_COMMON),
 		Barrier(g_shared_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 	};
-	g_cmd->ResourceBarrier(1, &toColor);
-	g_cmd->ResourceBarrier(1, &toOutput);
+	g_commands.list()->ResourceBarrier(1, &toColor);
+	g_commands.list()->ResourceBarrier(1, &toOutput);
 
-	NGXResult er = g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
-	g_cmd->ResourceBarrier(2, toCommon);
+	NGXResult er =
+		g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_commands.list(), g_feature, g_params, nullptr);
+	g_commands.list()->ResourceBarrier(2, toCommon);
 	if (er != NGX_SUCCESS) {
 		SetError("DLSSNR EvaluateFeature failed: 0x%08X (%s)", static_cast<unsigned>(er),
 			 ngx_diagnostics::result_name(static_cast<uint32_t>(er)));
@@ -1521,7 +1512,41 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 void shutdown()
 {
 	std::lock_guard<std::mutex> guard(g_mutex);
-	ShutdownUnlocked();
+	if (!g_finalized)
+		ShutdownUnlocked();
+}
+
+void finalize_shutdown()
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	if (g_finalized)
+		return;
+	g_finalized = true;
+	if (ShutdownUnlocked())
+		return;
+	// OBS is unloading the module with no proof the queue stopped. The
+	// callback is already disconnected. Keep the NGX session, GPU handles
+	// and event alive until process exit instead of releasing them in flight
+	// or letting static COM destructors release them under the loader lock.
+	blog(LOG_WARNING, "[obs-dlss5-nr] GPU work still pending at unload; retaining the session until process exit");
+	g_commands.abandon();
+	g_device.Detach();
+	g_adapter.Detach();
+	g_color.Detach();
+	g_output.Detach();
+	g_upload.Detach();
+	g_readback.Detach();
+	g_mvec.Detach();
+	g_mvec_upload.Detach();
+	g_helper_device.Detach();
+	g_helper_ctx.Detach();
+	g_obs_in.Detach();
+	g_relay_in.Detach();
+	g_relay_out.Detach();
+	g_obs_out.Detach();
+	g_shared_color.Detach();
+	g_shared_output.Detach();
+	NvofShutdown();
 }
 
 bool ready()

@@ -5,7 +5,7 @@
 > ⚠️ **Windows x64. NVIDIA currently officially supports DLSS 5 Neural Rendering on RTX 50-series.** Older RTX generations are not verified with this plugin and an unmodified runtime. Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Features (v1.3.0)
+## Features (v1.3.1)
 
 - DLSS 5 Neural Rendering on any OBS video source, live
 - **Style**: Default / Natural / Cinematic (rebuilds the NR feature on change)
@@ -19,6 +19,7 @@
 - **Live performance status** — actual enhanced FPS, processing dimensions, path, and last processing time in the Status field and periodic OBS logs. Reopen filter properties to refresh the Status snapshot.
 - **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps in both processing modes; between NR frames the last enhanced frame is displayed (a performance dial)
 - **Reset History** button (fixes smearing after scene cuts)
+- **Recovery after a GPU timeout** — video passes through while the prior GPU submission finishes. The filter resumes neural rendering after it can safely reset the D3D12 command list and allocator.
 - **Troubleshooting controls** — Advanced → Diagnostic logging and Retry Feature Now; readable NGX result names and throttled failure logs in both processing modes
 - **Feature creation cooldown** — unchanged failed creation settings retry at most every five seconds, with immediate retry on a creation-setting change or manual request
 - Clean shutdown — the NGX modules are left mapped for process lifetime (unloading them deadlocked inside the NVIDIA D3D12 driver); OBS exits normally
@@ -150,7 +151,7 @@ Non-Windows platforms build an empty module (the filter only registers on `_WIN3
 
 ## Releases
 
-Semantic-version tags (for example `v1.3.0`) trigger the Windows-only build and regression tests. The release workflow uses **curl** to create a draft with versioned patch notes and a checksum, attaching only the Windows x64 ZIP. The ZIP includes the README, license, and patch notes. GitHub also displays its automatic source-code links. See [release instructions](docs/RELEASING.md).
+Semantic version tags such as `v1.3.1` trigger the Windows build and regression tests. The workflow uses **curl** to create a GitHub release draft with a checksum and the Windows x64 ZIP. Read the release notes on the GitHub Releases page. See [release instructions](docs/RELEASING.md).
 
 ## License
 

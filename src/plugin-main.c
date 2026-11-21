@@ -39,5 +39,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+#ifdef _WIN32
+	finalize_dlss5nr_filter();
+#endif
 	obs_log(LOG_INFO, "plugin unloaded");
 }

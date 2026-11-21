@@ -42,7 +42,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 if(OS_WINDOWS)
   target_sources(
     ${CMAKE_PROJECT_NAME}
-    PRIVATE src/dlss5-nr-filter.cpp src/bridge/nr_bridge.cpp src/bridge/nvof_flow.cpp
+    PRIVATE src/dlss5-nr-filter.cpp src/bridge/d3d12-commands.cpp src/bridge/nr_bridge.cpp src/bridge/nvof_flow.cpp
   )
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE d3d11 d3d12 dxgi version)
 

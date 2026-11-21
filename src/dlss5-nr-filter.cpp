@@ -1048,3 +1048,8 @@ void register_dlss5nr_filter(void)
 	obs_register_source(&dlss5nr_filter_info);
 	blog(LOG_INFO, "[obs-dlss5-nr] filter registered");
 }
+
+void finalize_dlss5nr_filter(void)
+{
+	nrbridge::finalize_shutdown();
+}

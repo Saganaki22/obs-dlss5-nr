@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 void register_dlss5nr_filter(void);
+void finalize_dlss5nr_filter(void);
 
 #ifdef __cplusplus
 }

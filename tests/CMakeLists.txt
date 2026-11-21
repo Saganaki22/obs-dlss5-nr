@@ -5,6 +5,11 @@ add_executable(ngx-diagnostics-test ngx-diagnostics-test.cpp)
 add_test(NAME ngx-diagnostics COMMAND ngx-diagnostics-test)
 
 if(WIN32)
+  add_executable(d3d12-commands-test d3d12-commands-test.cpp ../src/bridge/d3d12-commands.cpp)
+  target_link_libraries(d3d12-commands-test PRIVATE d3d12 dxgi)
+  add_test(NAME d3d12-commands COMMAND d3d12-commands-test)
+  set_tests_properties(d3d12-commands PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+
   add_executable(ngx-log-lifetime-test ngx-log-lifetime-test.cpp)
   add_test(NAME ngx-log-lifetime COMMAND ngx-log-lifetime-test $<TARGET_FILE:nr-caller-shim>)
 endif()

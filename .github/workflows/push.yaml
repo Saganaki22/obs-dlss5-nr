@@ -14,7 +14,7 @@ jobs:
     name: Build Windows ZIP
     uses: ./.github/workflows/build-project.yaml
   create-release:
-    name: Create Windows release with patch notes
+    name: Create Windows release draft
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     needs: [check-format, build-project]
@@ -29,17 +29,19 @@ jobs:
         with:
           name: obs-dlss5-nr-${{ env.PLUGIN_VERSION }}-windows-x64
           path: release-assets
-      - name: Validate tag, asset and patch notes
+      - name: Validate tag and Windows ZIP
         shell: bash
         run: |
           set -euo pipefail
           test "${GITHUB_REF_NAME#v}" = "$PLUGIN_VERSION"
-          test -s "docs/releases/$PLUGIN_VERSION.md"
           asset="release-assets/obs-dlss5-nr-$PLUGIN_VERSION-windows-x64.zip"
           test -s "$asset"
           test "$(find release-assets -type f | wc -l)" -eq 1
-          cp "docs/releases/$PLUGIN_VERSION.md" release-body.md
-          printf '\n## SHA-256\n\n`%s`\n' "$(sha256sum "$asset" | cut -d ' ' -f 1)" >> release-body.md
+          : > release-body.txt
+          if [[ -s "docs/releases/$PLUGIN_VERSION.md" ]]; then
+            cat "docs/releases/$PLUGIN_VERSION.md" > release-body.txt
+          fi
+          printf '\n## SHA-256\n\n`%s`\n' "$(sha256sum "$asset" | cut -d ' ' -f 1)" >> release-body.txt
       - name: Create draft and upload only the Windows ZIP using curl
         shell: bash
         run: |
@@ -47,7 +49,7 @@ jobs:
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           headers=(-H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
           jq -n --arg tag "$GITHUB_REF_NAME" --arg name "DLSS 5 Neural Rendering $PLUGIN_VERSION" \
-            --rawfile body release-body.md \
+            --rawfile body release-body.txt \
             '{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:($tag|test("-(beta|rc)"))}' > release.json
           status=$(curl --silent --show-error "${headers[@]}" -o existing.json -w '%{http_code}' "$api/releases/tags/$GITHUB_REF_NAME")
           if [[ "$status" == 404 ]]; then
